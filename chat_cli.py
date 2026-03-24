@@ -206,6 +206,24 @@ def _to_account_endpoint(endpoint: str) -> str:
     return endpoint.rstrip("/")
 
 
+def _resolve_search_endpoint(endpoint: str | None, service_name: str | None) -> str | None:
+    """Resolve Azure AI Search endpoint from explicit endpoint or service name.
+
+    This mirrors the behavior in testseach.py where service name maps to:
+    https://<service>.search.windows.net
+    """
+
+    if endpoint and service_name:
+        raise ValueError(
+            "Set either AZURE_AI_SEARCH_ENDPOINT or AZURE_AI_SEARCH_SERVICE_NAME, not both."
+        )
+    if endpoint:
+        return endpoint.rstrip("/")
+    if service_name:
+        return f"https://{service_name}.search.windows.net"
+    return None
+
+
 def load_config() -> AppConfig:
     """Load and validate application settings from environment variables.
 
@@ -218,7 +236,10 @@ def load_config() -> AppConfig:
 
     load_dotenv(override=False)
 
-    search_endpoint = _optional_env("AZURE_AI_SEARCH_ENDPOINT")
+    search_endpoint = _resolve_search_endpoint(
+        _optional_env("AZURE_AI_SEARCH_ENDPOINT"),
+        _optional_env("AZURE_AI_SEARCH_SERVICE_NAME"),
+    )
     search_index_name = _optional_env("AZURE_AI_SEARCH_INDEX_NAME")
     mcp_openapi_spec_url = _optional_env("MCP_OPENAPI_SPEC_URL")
     mcp_base_url = _optional_env("MCP_BASE_URL")
@@ -231,7 +252,8 @@ def load_config() -> AppConfig:
 
     if bool(search_endpoint) != bool(search_index_name):
         raise ValueError(
-            "Set both AZURE_AI_SEARCH_ENDPOINT and AZURE_AI_SEARCH_INDEX_NAME "
+            "Set AZURE_AI_SEARCH_INDEX_NAME and one of "
+            "AZURE_AI_SEARCH_ENDPOINT/AZURE_AI_SEARCH_SERVICE_NAME "
             "to enable Azure AI Search grounding."
         )
 
