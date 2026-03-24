@@ -1,8 +1,12 @@
 import asyncio
+import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.request import Request, urlopen
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
@@ -11,7 +15,9 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai.chat_completion_client_base import ChatCompletionClientBase
+from semantic_kernel.connectors.ai.function_choice_behavior import FunctionChoiceBehavior
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion, AzureChatPromptExecutionSettings
+from semantic_kernel.connectors.openapi_plugin import OpenAPIFunctionExecutionParameters
 from semantic_kernel.contents.chat_history import ChatHistory
 import yaml
 
@@ -32,6 +38,10 @@ class AppConfig:
     search_strictness: int
     search_top_n_documents: int
     agent_prompt_file: str
+    mcp_openapi_spec_url: str | None
+    mcp_base_url: str | None
+    mcp_timeout_seconds: int
+    mcp_default_headers: dict[str, str]
 
 
 @dataclass
@@ -44,6 +54,24 @@ class AgentPromptExample:
 class AgentPromptConfig:
     prompt: str
     examples: list[AgentPromptExample]
+
+
+@dataclass
+class OpenAPIParameter:
+    name: str
+    location: str
+    required: bool
+    description: str
+
+
+@dataclass
+class OpenAPITool:
+    name: str
+    description: str
+    method: str
+    path: str
+    parameters: list[OpenAPIParameter]
+    request_body_required: bool
 
 
 def _required_env(name: str) -> str:
@@ -75,6 +103,25 @@ def _int_env(name: str, default: int) -> int:
         raise ValueError(f"Environment variable {name} must be an integer.") from exc
 
 
+def _json_object_env(name: str) -> dict[str, str]:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return {}
+
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Environment variable {name} must be valid JSON.") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Environment variable {name} must be a JSON object.")
+
+    normalized: dict[str, str] = {}
+    for k, v in parsed.items():
+        normalized[str(k)] = str(v)
+    return normalized
+
+
 def _bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name, "").strip().lower()
     if not value:
@@ -101,6 +148,10 @@ def load_config() -> AppConfig:
 
     search_endpoint = _optional_env("AZURE_AI_SEARCH_ENDPOINT")
     search_index_name = _optional_env("AZURE_AI_SEARCH_INDEX_NAME")
+    mcp_openapi_spec_url = _optional_env("MCP_OPENAPI_SPEC_URL")
+    mcp_base_url = _optional_env("MCP_BASE_URL")
+    mcp_timeout_seconds = _int_env("MCP_TIMEOUT_SECONDS", 30)
+    mcp_default_headers = _json_object_env("MCP_DEFAULT_HEADERS")
 
     provider = os.getenv("CHAT_PROVIDER", "azure_openai").strip().lower()
     if provider not in {"azure_openai", "foundry"}:
@@ -128,6 +179,10 @@ def load_config() -> AppConfig:
             search_strictness=_int_env("AZURE_AI_SEARCH_STRICTNESS", 3),
             search_top_n_documents=_int_env("AZURE_AI_SEARCH_TOP_N_DOCUMENTS", 5),
             agent_prompt_file=os.getenv("AGENT_PROMPT_FILE", "agents/default.yaml").strip(),
+            mcp_openapi_spec_url=mcp_openapi_spec_url,
+            mcp_base_url=mcp_base_url,
+            mcp_timeout_seconds=mcp_timeout_seconds,
+            mcp_default_headers=mcp_default_headers,
         )
 
     # Foundry project endpoints are OpenAI-compatible for chat deployments.
@@ -146,7 +201,309 @@ def load_config() -> AppConfig:
         search_strictness=_int_env("AZURE_AI_SEARCH_STRICTNESS", 3),
         search_top_n_documents=_int_env("AZURE_AI_SEARCH_TOP_N_DOCUMENTS", 5),
         agent_prompt_file=os.getenv("AGENT_PROMPT_FILE", "agents/default.yaml").strip(),
+        mcp_openapi_spec_url=mcp_openapi_spec_url,
+        mcp_base_url=mcp_base_url,
+        mcp_timeout_seconds=mcp_timeout_seconds,
+        mcp_default_headers=mcp_default_headers,
     )
+
+
+def _normalize_tool_name(method: str, path: str) -> str:
+    raw_name = f"{method}_{path}"
+    return re.sub(r"[^a-zA-Z0-9_]", "_", raw_name).strip("_")
+
+
+def _load_openapi_document(spec_url: str, timeout_seconds: int) -> dict[str, object]:
+    try:
+        with urlopen(spec_url, timeout=timeout_seconds) as response:
+            payload = response.read().decode("utf-8")
+    except URLError as exc:
+        raise ValueError(f"Unable to load MCP OpenAPI spec from {spec_url}: {exc}") from exc
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        parsed = yaml.safe_load(payload)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("MCP OpenAPI spec must be a JSON or YAML object.")
+
+    version = str(parsed.get("openapi", "")).strip()
+    if not version.startswith("3"):
+        raise ValueError("MCP OpenAPI spec must be version 3.x.")
+
+    return parsed
+
+
+def _resolve_openapi_base_url(
+    spec: dict[str, object],
+    spec_url: str,
+    base_url_override: str | None,
+) -> str:
+    if base_url_override:
+        return base_url_override.rstrip("/")
+
+    origin = _to_account_endpoint(spec_url)
+    servers = spec.get("servers", [])
+    if isinstance(servers, list):
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            raw_url = str(server.get("url", "")).strip()
+            if not raw_url:
+                continue
+
+            if raw_url.startswith("/"):
+                return urljoin(origin + "/", raw_url.lstrip("/")).rstrip("/")
+
+            parsed = urlparse(raw_url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                host = parsed.hostname or ""
+                if host not in {"localhost", "127.0.0.1"}:
+                    return raw_url.rstrip("/")
+
+    return origin
+
+
+class OpenAPIMCPInterface:
+    def __init__(
+        self,
+        spec_url: str,
+        base_url_override: str | None,
+        timeout_seconds: int,
+        default_headers: dict[str, str],
+    ) -> None:
+        self.spec_url = spec_url
+        self.base_url_override = base_url_override
+        self.timeout_seconds = timeout_seconds
+        self.default_headers = default_headers
+        self.base_url = ""
+        self._tools: dict[str, OpenAPITool] = {}
+        self.reload()
+
+    def reload(self) -> None:
+        spec = _load_openapi_document(self.spec_url, self.timeout_seconds)
+        self.base_url = _resolve_openapi_base_url(spec, self.spec_url, self.base_url_override)
+        self._tools = self._parse_tools(spec)
+
+    def list_tools(self) -> list[OpenAPITool]:
+        return sorted(self._tools.values(), key=lambda item: item.name)
+
+    def call_tool(self, tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        tool = self._tools.get(tool_name)
+        if tool is None:
+            available = ", ".join(sorted(self._tools.keys()))
+            raise ValueError(f"Unknown MCP tool '{tool_name}'. Available tools: {available}")
+
+        request_path = tool.path
+        query_items: list[tuple[str, str]] = []
+        request_headers: dict[str, str] = dict(self.default_headers)
+        cookie_items: list[str] = []
+
+        for parameter in tool.parameters:
+            value = arguments.get(parameter.name)
+            if parameter.required and value is None:
+                raise ValueError(
+                    f"Missing required argument '{parameter.name}' for tool '{tool_name}'."
+                )
+            if value is None:
+                continue
+
+            if parameter.location == "path":
+                request_path = request_path.replace(
+                    "{" + parameter.name + "}",
+                    quote(str(value), safe=""),
+                )
+            elif parameter.location == "query":
+                query_items.append((parameter.name, str(value)))
+            elif parameter.location == "header":
+                request_headers[parameter.name] = str(value)
+            elif parameter.location == "cookie":
+                cookie_items.append(f"{parameter.name}={value}")
+
+        if cookie_items:
+            request_headers["Cookie"] = "; ".join(cookie_items)
+
+        request_url = urljoin(self.base_url.rstrip("/") + "/", request_path.lstrip("/"))
+        if query_items:
+            request_url = f"{request_url}?{urlencode(query_items)}"
+
+        request_body: bytes | None = None
+        if "body" in arguments:
+            request_body = json.dumps(arguments["body"]).encode("utf-8")
+            request_headers.setdefault("Content-Type", "application/json")
+        elif tool.request_body_required:
+            raise ValueError(f"Tool '{tool_name}' requires a JSON 'body' argument.")
+
+        request = Request(
+            url=request_url,
+            method=tool.method.upper(),
+            headers=request_headers,
+            data=request_body,
+        )
+
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                raw_body = response.read().decode("utf-8")
+                status = response.status
+                response_headers = dict(response.headers.items())
+        except HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"MCP tool call failed: HTTP {exc.code} on {tool.method.upper()} {request_url}"
+                f"\n{error_body}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(
+                f"MCP tool call failed: unable to reach {request_url}: {exc}"
+            ) from exc
+
+        try:
+            parsed_body: object = json.loads(raw_body) if raw_body.strip() else {}
+        except json.JSONDecodeError:
+            parsed_body = raw_body
+
+        return {
+            "tool": tool.name,
+            "method": tool.method.upper(),
+            "url": request_url,
+            "status": status,
+            "headers": response_headers,
+            "data": parsed_body,
+        }
+
+    def _parse_tools(self, spec: dict[str, object]) -> dict[str, OpenAPITool]:
+        paths = spec.get("paths", {})
+        if not isinstance(paths, dict):
+            raise ValueError("OpenAPI spec 'paths' must be an object.")
+
+        tools: dict[str, OpenAPITool] = {}
+        for path, path_item in paths.items():
+            if not isinstance(path, str) or not isinstance(path_item, dict):
+                continue
+
+            for method, operation in path_item.items():
+                method_name = str(method).lower()
+                if method_name not in {"get", "post", "put", "patch", "delete", "head", "options"}:
+                    continue
+                if not isinstance(operation, dict):
+                    continue
+
+                operation_id = str(operation.get("operationId", "")).strip()
+                tool_name = operation_id if operation_id else _normalize_tool_name(method_name, path)
+                description = str(
+                    operation.get("description")
+                    or operation.get("summary")
+                    or f"{method_name.upper()} {path}"
+                ).strip()
+
+                raw_parameters = operation.get("parameters", [])
+                parameters: list[OpenAPIParameter] = []
+                if isinstance(raw_parameters, list):
+                    for item in raw_parameters:
+                        if not isinstance(item, dict):
+                            continue
+                        name = str(item.get("name", "")).strip()
+                        location = str(item.get("in", "")).strip().lower()
+                        if not name or location not in {"path", "query", "header", "cookie"}:
+                            continue
+                        parameters.append(
+                            OpenAPIParameter(
+                                name=name,
+                                location=location,
+                                required=bool(item.get("required", False)),
+                                description=str(item.get("description", "")).strip(),
+                            )
+                        )
+
+                request_body_required = False
+                request_body = operation.get("requestBody")
+                if isinstance(request_body, dict):
+                    request_body_required = bool(request_body.get("required", False))
+
+                tools[tool_name] = OpenAPITool(
+                    name=tool_name,
+                    description=description,
+                    method=method_name,
+                    path=path,
+                    parameters=parameters,
+                    request_body_required=request_body_required,
+                )
+
+        if not tools:
+            raise ValueError("No operations found in MCP OpenAPI spec.")
+        return tools
+
+
+def _format_mcp_help() -> str:
+    return (
+        "MCP commands:\n"
+        "  /mcp tools\n"
+        "  /mcp tools/list\n"
+        "  /mcp call <tool_name> <json-args>\n"
+        "  /mcp tools/call <tool_name> <json-args>\n"
+        "  /mcp reload\n"
+        "Example:\n"
+        "  /mcp call getWeatherForecast {\"latitude\":47.6,\"longitude\":-122.3}\n"
+    )
+
+
+def _build_openapi_auth_callback(default_headers: dict[str, str]):
+    async def _auth_callback(**_kwargs) -> dict[str, str]:  # noqa: ANN003
+        return dict(default_headers)
+
+    return _auth_callback
+
+
+def _handle_mcp_command(command_text: str, mcp: OpenAPIMCPInterface | None) -> bool:
+    if not command_text.startswith("/mcp"):
+        return False
+
+    if mcp is None:
+        print("mcp> MCP is not enabled. Set MCP_OPENAPI_SPEC_URL in .env")
+        return True
+
+    text = command_text.strip()
+    if text in {"/mcp", "/mcp help", "/mcp ?"}:
+        print(_format_mcp_help())
+        return True
+
+    if text in {"/mcp tools", "/mcp tools/list"}:
+        print("mcp> available tools:")
+        for tool in mcp.list_tools():
+            required_args = [p.name for p in tool.parameters if p.required]
+            suffix = f" | required: {', '.join(required_args)}" if required_args else ""
+            body_suffix = " | requires body" if tool.request_body_required else ""
+            print(f"- {tool.name}: {tool.method.upper()} {tool.path}{suffix}{body_suffix}")
+        return True
+
+    if text == "/mcp reload":
+        mcp.reload()
+        print(f"mcp> reloaded spec, tools available: {len(mcp.list_tools())}")
+        return True
+
+    tokens = text.split(maxsplit=3)
+    if len(tokens) >= 3 and tokens[1] in {"call", "tools/call"}:
+        tool_name = tokens[2]
+        arguments: dict[str, object] = {}
+        if len(tokens) == 4:
+            try:
+                loaded = json.loads(tokens[3])
+            except json.JSONDecodeError as exc:
+                print(f"mcp> invalid JSON arguments: {exc}")
+                return True
+            if not isinstance(loaded, dict):
+                print("mcp> JSON arguments must be an object.")
+                return True
+            arguments = loaded
+
+        result = mcp.call_tool(tool_name, arguments)
+        print("mcp> tool result:")
+        print(json.dumps(result, indent=2))
+        return True
+
+    print(_format_mcp_help())
+    return True
 
 
 def load_agent_prompt_config(file_path: str) -> AgentPromptConfig:
@@ -270,9 +627,56 @@ async def run_chat() -> None:
 
     settings = AzureChatPromptExecutionSettings(temperature=0.7)
     search_data_source = build_search_data_source(config)
+    search_grounding_active = False
     if search_data_source:
         # Azure OpenAI/Foundry "On Your Data" payload.
         settings.extra_body = {"data_sources": [search_data_source]}
+        search_grounding_active = True
+
+    mcp_interface: OpenAPIMCPInterface | None = None
+    mcp_auto_plugin_enabled = False
+    if config.mcp_openapi_spec_url:
+        try:
+            mcp_interface = OpenAPIMCPInterface(
+                spec_url=config.mcp_openapi_spec_url,
+                base_url_override=config.mcp_base_url,
+                timeout_seconds=config.mcp_timeout_seconds,
+                default_headers=config.mcp_default_headers,
+            )
+
+            openapi_spec = _load_openapi_document(
+                spec_url=config.mcp_openapi_spec_url,
+                timeout_seconds=config.mcp_timeout_seconds,
+            )
+            openapi_execution_settings = OpenAPIFunctionExecutionParameters(
+                server_url_override=mcp_interface.base_url,
+                timeout=float(config.mcp_timeout_seconds),
+                auth_callback=_build_openapi_auth_callback(config.mcp_default_headers),
+            )
+            kernel.add_plugin_from_openapi(
+                plugin_name="mcp",
+                openapi_parsed_spec=openapi_spec,
+                execution_settings=openapi_execution_settings,
+                description="Tools loaded from MCP OpenAPI spec",
+            )
+            settings.function_choice_behavior = FunctionChoiceBehavior.Auto(
+                auto_invoke=True,
+                filters={"included_plugins": ["mcp"]},
+            )
+            mcp_auto_plugin_enabled = True
+
+            # Current Foundry/Azure OpenAI chat endpoint behavior can reject the
+            # message sequence produced when both OYD grounding and auto tool
+            # invocation are enabled at the same time.
+            if search_grounding_active:
+                settings.extra_body = None
+                search_grounding_active = False
+                print(
+                    "MCP init: Azure AI Search grounding disabled because it is "
+                    "currently incompatible with automatic MCP tool-calling."
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"MCP init error: {exc}")
 
     kb = KeyBindings()
     should_exit = False
@@ -296,13 +700,24 @@ async def run_chat() -> None:
         print("Auth mode: API key")
     else:
         print("Auth mode: Azure Default Credential")
-    if search_data_source:
+    if search_grounding_active:
         print(f"Grounding: Azure AI Search enabled (index: {config.search_index_name})")
     else:
         print("Grounding: disabled")
     print(f"Agent prompt config: {config.agent_prompt_file}")
     if agent_prompt_config.examples:
         print(f"Agent examples loaded: {len(agent_prompt_config.examples)}")
+    if mcp_interface:
+        print(f"MCP: enabled ({len(mcp_interface.list_tools())} tools from OpenAPI)")
+        print("MCP commands: /mcp tools, /mcp call <tool_name> <json-args>, /mcp reload")
+        if mcp_auto_plugin_enabled:
+            print("MCP auto-calling: enabled via Semantic Kernel plugin")
+        else:
+            print("MCP auto-calling: disabled")
+    elif config.mcp_openapi_spec_url:
+        print("MCP: disabled due to initialization error")
+    else:
+        print("MCP: disabled")
     print("Press Ctrl+X or Ctrl+C to exit.\n")
 
     with patch_stdout():
@@ -319,6 +734,14 @@ async def run_chat() -> None:
                 break
 
             if not user_text:
+                continue
+
+            try:
+                if _handle_mcp_command(user_text, mcp_interface):
+                    print()
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                print(f"mcp> [error] {exc}\n")
                 continue
 
             history.add_user_message(user_text)

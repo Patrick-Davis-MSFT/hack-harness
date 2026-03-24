@@ -8,6 +8,7 @@ A Python command-line chat harness built with Semantic Kernel.
 - Supports two endpoint modes from `.env`:
 	- Azure OpenAI endpoint
 	- Foundry project endpoint with chat deployment
+- Optional MCP-like tool interface backed by a published OpenAPI 3.x spec.
 - Exits on `Ctrl+C` or `Ctrl+X`.
 
 ## Files
@@ -99,6 +100,45 @@ AZURE_AI_SEARCH_TOP_N_DOCUMENTS=5
 ```
 
 When enabled, the CLI prints that grounding is active and shows the selected index name at startup.
+
+### Optional: MCP-like OpenAPI tools
+
+You can enable an MCP-style tool surface where each OpenAPI operation is exposed as a callable tool in the CLI.
+When configured, Semantic Kernel also loads the OpenAPI operations as a plugin and can automatically invoke tools during normal chat turns.
+
+```env
+MCP_OPENAPI_SPEC_URL=https://func-amdojxfludppe.azurewebsites.net/api/spec/openapi?code=<your-code>
+MCP_BASE_URL=
+MCP_TIMEOUT_SECONDS=30
+MCP_DEFAULT_HEADERS={}
+```
+
+Notes:
+
+- `MCP_OPENAPI_SPEC_URL` is required to enable MCP commands.
+- `MCP_BASE_URL` is optional; if empty, the app resolves a base URL from the spec. If the spec server points to localhost, it falls back to the spec URL host.
+- `MCP_DEFAULT_HEADERS` must be a JSON object string (for example `{"x-api-key":"..."}`).
+
+Interactive commands:
+
+```text
+/mcp tools
+/mcp tools/list
+/mcp call <tool_name> <json-args>
+/mcp tools/call <tool_name> <json-args>
+/mcp reload
+```
+
+Automatic mode:
+
+- Ask naturally in chat (for example, "What's the weather in Seattle?") and the model can automatically select and call MCP/OpenAPI tools.
+- Slash commands remain available for manual inspection and testing.
+
+Example:
+
+```text
+/mcp call getWeatherForecast {"latitude":47.6,"longitude":-122.3}
+```
 
 ## Run
 
