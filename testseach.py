@@ -1,7 +1,7 @@
 """Search Azure AI Search and print top documents.
 Install Requirements
 
-pip3 install -r quickpython/requirements.txt
+pip3 install -r req-testsearch.txt
 Usage examples:
 python testseach.py --service-name mysearch --index-name docs --query "azure"
 python testseach.py --endpoint https://mysearch.search.windows.net --index-name docs --query "*" --key <admin-or-query-key>
