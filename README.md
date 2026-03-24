@@ -1,4 +1,4 @@
-# netl-hack-harness
+# hack-harness
 
 A Python command-line chat harness built with Semantic Kernel.
 
